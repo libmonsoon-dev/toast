@@ -2,6 +2,7 @@ package toast
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -238,7 +239,7 @@ func (n *Notification) buildXML() (string, error) {
 //	    log.Fatalln(err)
 //	}
 func (n *Notification) Push() error {
-	cmd, err := n.buildCommand()
+	cmd, err := n.buildCommand(context.Background())
 	if err != nil {
 		return fmt.Errorf("build command: %w", err)
 	}
@@ -248,8 +249,8 @@ func (n *Notification) Push() error {
 
 // BuildCommand works like Push, but instead of running *exec.Cmd it just returns it.
 // The caller must call Cleanup after finishing with Notification
-func (n *Notification) BuildCommand() (*exec.Cmd, error) {
-	cmd, err := n.buildCommand()
+func (n *Notification) BuildCommand(ctx context.Context) (*exec.Cmd, error) {
+	cmd, err := n.buildCommand(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("build command: %w", err)
 	}
@@ -265,7 +266,7 @@ func (n *Notification) Cleanup() error {
 	return os.Remove(n.fileName())
 }
 
-func (n *Notification) buildCommand() (*exec.Cmd, error) {
+func (n *Notification) buildCommand(ctx context.Context) (*exec.Cmd, error) {
 	n.applyDefaults()
 	if n.fileName() == "" {
 		err := n.renderTemporaryScript()
@@ -273,7 +274,7 @@ func (n *Notification) buildCommand() (*exec.Cmd, error) {
 			return nil, fmt.Errorf("render temporary script: %w", err)
 		}
 	}
-	return n.buildTemporaryScriptCommand()
+	return n.buildTemporaryScriptCommand(ctx), nil
 }
 
 func (n *Notification) renderTemporaryScript() error {
@@ -301,10 +302,10 @@ func (n *Notification) renderTemporaryScript() error {
 	return nil
 }
 
-func (n *Notification) buildTemporaryScriptCommand() (*exec.Cmd, error) {
-	cmd := exec.Command("PowerShell", "-ExecutionPolicy", "Bypass", "-File", n.fileName())
+func (n *Notification) buildTemporaryScriptCommand(ctx context.Context) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "PowerShell", "-ExecutionPolicy", "Bypass", "-File", n.fileName())
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return cmd, nil
+	return cmd
 }
 
 func (n *Notification) fileName() string {
