@@ -3,22 +3,23 @@ package toast
 import (
 	"bytes"
 	"errors"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"text/template"
 
 	"github.com/nu7hatch/gouuid"
-	"syscall"
 )
 
 var toastTemplate *template.Template
 
 var (
-	ErrorInvalidAudio    error = errors.New("toast: invalid audio")
-	ErrorInvalidDuration       = errors.New("toast: invalid duration")
+	ErrorInvalidAudio    = errors.New("toast: invalid audio")
+	ErrorInvalidDuration = errors.New("toast: invalid duration")
 )
 
 type toastAudio string
@@ -133,16 +134,16 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
 // The following would show a notification to the user letting them know they received an email, and opens
 // gmail.com when they click the notification. It also makes the Windows 10 "mail" sound effect.
 //
-//     toast := toast.Notification{
-//         AppID:               "Google Mail",
-//         Title:               email.Subject,
-//         Message:             email.Preview,
-//         Icon:                "C:/Program Files/Google Mail/icons/logo.png",
-//         ActivationArguments: "https://gmail.com",
-//         Audio:               toast.Mail,
-//     }
+//	toast := toast.Notification{
+//	    AppID:               "Google Mail",
+//	    Title:               email.Subject,
+//	    Message:             email.Preview,
+//	    Icon:                "C:/Program Files/Google Mail/icons/logo.png",
+//	    ActivationArguments: "https://gmail.com",
+//	    Audio:               toast.Mail,
+//	}
 //
-//     err := toast.Push()
+//	err := toast.Push()
 type Notification struct {
 	// The name of your app. This value shows up in Windows 10's Action Centre, so make it
 	// something readable for your users. It can contain spaces, however special characters
@@ -175,6 +176,9 @@ type Notification struct {
 
 	// How long the toast should show up for (short/long)
 	Duration toastDuration
+
+	mu             sync.Mutex
+	scriptFileName string
 }
 
 // Action
@@ -186,7 +190,7 @@ type Notification struct {
 // user's choice. Examples of protocol type action buttons include: "bingmaps:?q=sushi" to open up Windows 10's
 // maps app with a pre-populated search field set to "sushi".
 //
-//     toast.Action{"protocol", "Open Maps", "bingmaps:?q=sushi"}
+//	toast.Action{"protocol", "Open Maps", "bingmaps:?q=sushi"}
 type Action struct {
 	Type      string
 	Label     string
@@ -214,32 +218,100 @@ func (n *Notification) buildXML() (string, error) {
 	return out.String(), nil
 }
 
-// Builds the Windows PowerShell script & invokes it, causing the toast to display.
+// Push Builds the Windows PowerShell script & invokes it, causing the toast to display.
 //
 // Note: Running the PowerShell script is by far the slowest process here, and can take a few
 // seconds in some cases.
 //
-//     notification := toast.Notification{
-//         AppID: "Example App",
-//         Title: "My notification",
-//         Message: "Some message about how important something is...",
-//         Icon: "go.png",
-//         Actions: []toast.Action{
-//             {"protocol", "I'm a button", ""},
-//             {"protocol", "Me too!", ""},
-//         },
-//     }
-//     err := notification.Push()
-//     if err != nil {
-//         log.Fatalln(err)
-//     }
+//	notification := toast.Notification{
+//	    AppID: "Example App",
+//	    Title: "My notification",
+//	    Message: "Some message about how important something is...",
+//	    Icon: "go.png",
+//	    Actions: []toast.Action{
+//	        {"protocol", "I'm a button", ""},
+//	        {"protocol", "Me too!", ""},
+//	    },
+//	}
+//	err := notification.Push()
+//	if err != nil {
+//	    log.Fatalln(err)
+//	}
 func (n *Notification) Push() error {
+	cmd, err := n.buildCommand()
+	if err != nil {
+		return fmt.Errorf("build command: %w", err)
+	}
+	defer os.Remove(n.fileName())
+	return cmd.Run()
+}
+
+// BuildCommand works like Push, but instead of running *exec.Cmd it just returns it.
+// The caller must call Cleanup after finishing with Notification
+func (n *Notification) BuildCommand() (*exec.Cmd, error) {
+	cmd, err := n.buildCommand()
+	if err != nil {
+		return nil, fmt.Errorf("build command: %w", err)
+	}
+
+	return cmd, nil
+}
+
+func (n *Notification) Cleanup() error {
+	if n.fileName() == "" {
+		return nil
+	}
+
+	return os.Remove(n.fileName())
+}
+
+func (n *Notification) buildCommand() (*exec.Cmd, error) {
 	n.applyDefaults()
+	if n.fileName() == "" {
+		err := n.renderTemporaryScript()
+		if err != nil {
+			return nil, fmt.Errorf("render temporary script: %w", err)
+		}
+	}
+	return n.buildTemporaryScriptCommand()
+}
+
+func (n *Notification) renderTemporaryScript() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	xml, err := n.buildXML()
 	if err != nil {
-		return err
+		return fmt.Errorf("build XML: %w", err)
 	}
-	return invokeTemporaryScript(xml)
+
+	id, err := uuid.NewV4()
+	if err != nil {
+		return fmt.Errorf("new uuid v4: %w", err)
+	}
+
+	n.scriptFileName = filepath.Join(os.TempDir(), id.String()+".ps1")
+	bomUtf8 := []byte{0xEF, 0xBB, 0xBF}
+	out := append(bomUtf8, []byte(xml)...)
+	err = os.WriteFile(n.scriptFileName, out, 0600)
+	if err != nil {
+		return fmt.Errorf("write to %s: %w", n.scriptFileName, err)
+	}
+
+	return nil
+}
+
+func (n *Notification) buildTemporaryScriptCommand() (*exec.Cmd, error) {
+	cmd := exec.Command("PowerShell", "-ExecutionPolicy", "Bypass", "-File", n.fileName())
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return cmd, nil
+}
+
+func (n *Notification) fileName() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	return n.scriptFileName
 }
 
 // Returns a toastAudio given a user-provided input (useful for cli apps).
@@ -338,22 +410,4 @@ func Duration(name string) (toastDuration, error) {
 	default:
 		return Short, ErrorInvalidDuration
 	}
-}
-
-func invokeTemporaryScript(content string) error {
-	id, _ := uuid.NewV4()
-	file := filepath.Join(os.TempDir(), id.String()+".ps1")
-	defer os.Remove(file)
-	bomUtf8 := []byte{0xEF, 0xBB, 0xBF}
-	out := append(bomUtf8, []byte(content)...)
-	err := ioutil.WriteFile(file, out, 0600)
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command("PowerShell", "-ExecutionPolicy", "Bypass", "-File", file)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if err = cmd.Run(); err != nil {
-		return err
-	}
-	return nil
 }
